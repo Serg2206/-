@@ -109,7 +109,7 @@ Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } | ForEa
     if ($_.State -ne 'Disabled' -and $isScript -and ($lvl -eq 'Highest' -or $_.Principal.UserId -match 'SYSTEM')) {
         Add-Flag "Задача '$($_.TaskName)' запускает скрипт С ПРАВАМИ АДМИНИСТРАТОРА/SYSTEM."
     }
-    if ($act -match 'OneDrive') { Add-Flag "Задача '$($_.TaskName)' запускает файл из OneDrive (при синхронизации файл может отсутствовать или быть подменён)." }
+    if ($env:OneDrive -and $act -like "*$env:OneDrive*") { Add-Flag "Задача '$($_.TaskName)' запускает файл из OneDrive (при синхронизации файл может отсутствовать или быть подменён)." }
 }
 
 # ---------------------------------------------------------------------------

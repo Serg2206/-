@@ -86,9 +86,17 @@ Say "  Проверяет и восстанавливает системные �
 $cbs = Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2; StartTime=(Get-Date).AddDays(-7)} -ErrorAction SilentlyContinue
 Say ("  Критических/ошибок в журнале System за 7 дней: {0}" -f @($cbs).Count)
 if (Confirm-Step "Запустить DISM /RestoreHealth и SFC /scannow?") {
-    DISM.exe /Online /Cleanup-Image /RestoreHealth
+    DISM.exe /Online /Cleanup-Image /RestoreHealth | Out-Host
     sfc.exe /scannow
-    Note "Выполнены DISM /RestoreHealth и SFC /scannow (результат — в transcript.log)."
+    # Вывод SFC (UTF-16) не попадает в transcript — итог берём из CBS.log
+    $cbsCopy = Join-Path $env:TEMP 'cbs_copy.log'
+    Copy-Item "$env:windir\Logs\CBS\CBS.log" $cbsCopy -Force -ErrorAction SilentlyContinue
+    $sr = Select-String $cbsCopy -Pattern '\[SR\]' -ErrorAction SilentlyContinue
+    $cannot = @($sr | Where-Object { $_.Line -match 'Cannot repair' }).Count
+    $fixed  = @($sr | Where-Object { $_.Line -match 'Repaired file|Repairing corrupted file' }).Count
+    Remove-Item $cbsCopy -Force -ErrorAction SilentlyContinue
+    $img = (Repair-WindowsImage -Online -CheckHealth).ImageHealthState
+    Note "DISM: образ $img. SFC: исправлено файлов $fixed, не удалось исправить $cannot."
 }
 
 # ---------------------------------------------------------------------------

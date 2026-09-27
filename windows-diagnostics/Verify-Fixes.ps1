@@ -63,13 +63,22 @@ if ($last) {
     if ($applied) { Add-Check OK 'Режим -Apply выполнен' $last.Name } else { Add-Check FAIL 'Режим -Apply выполнен' "последний запуск ($($last.Name)) — только аудит" }
     $rp = Get-ComputerRestorePoint | Where-Object { $_.Description -like 'SSV-Optimize*' } | Select-Object -Last 1
     if ($rp) { Add-Check OK 'Точка восстановления' $rp.Description } else { Add-Check WARN 'Точка восстановления' 'SSV-Optimize не найдена' }
-    $sfc = Select-String $tr -Pattern 'Защита ресурсов Windows|Windows Resource Protection' | Select-Object -Last 1
-    if (-not $sfc) { Add-Check WARN 'SFC' 'не запускался (ответ N?)' }
-    elseif ($sfc.Line -match 'не обнаружила|did not find') { Add-Check OK 'SFC' 'нарушений целостности нет' }
-    elseif ($sfc.Line -match 'успешно|successfully') { Add-Check OK 'SFC' 'повреждения найдены и ИСПРАВЛЕНЫ' }
-    else { Add-Check FAIL 'SFC' $sfc.Line.Trim() }
-    $dism = Select-String $tr -Pattern 'Операция успешно завершена|operation completed successfully|Восстановление выполнено|restore operation completed' -Quiet
-    if ($dism) { Add-Check OK 'DISM /RestoreHealth' 'успешно' } else { Add-Check WARN 'DISM /RestoreHealth' 'нет отметки об успехе в журнале' }
+    # Вывод DISM/SFC не попадает в transcript — берём результат из системных журналов
+    $img = Repair-WindowsImage -Online -CheckHealth
+    if ($img.ImageHealthState -eq 'Healthy') { Add-Check OK 'DISM: состояние образа Windows' 'Healthy' }
+    else { Add-Check FAIL 'DISM: состояние образа Windows' $img.ImageHealthState }
+    $cbsCopy = Join-Path $env:TEMP 'cbs_copy.log'
+    Copy-Item "$env:windir\Logs\CBS\CBS.log" $cbsCopy -Force
+    $sr = Select-String $cbsCopy -Pattern '\[SR\]'
+    if (-not $sr) { Add-Check WARN 'SFC' 'записей SFC в CBS.log нет (журнал мог смениться)' }
+    else {
+        $cannot   = @($sr | Where-Object { $_.Line -match 'Cannot repair' }).Count
+        $repaired = @($sr | Where-Object { $_.Line -match 'Repaired file|Repairing corrupted file' }).Count
+        if ($cannot -gt 0) { Add-Check FAIL 'SFC' "не удалось восстановить файлов: $cannot" }
+        elseif ($repaired -gt 0) { Add-Check OK 'SFC' "повреждения найдены и исправлены ($repaired)" }
+        else { Add-Check OK 'SFC' 'нарушений целостности нет' }
+    }
+    Remove-Item $cbsCopy -Force
     $sum = Join-Path $last.FullName 'summary.txt'
     if (Test-Path $sum) { $out.Add('--- summary.txt ---'); Get-Content $sum | ForEach-Object { $out.Add("   $_") } }
 } else { Add-Check FAIL 'Optimize-Workstation' 'папка C:\SSV-Optimize не найдена' }
@@ -83,6 +92,7 @@ $crit = Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2; StartTime=$
 $hours = [math]::Max(1, [math]::Round(((Get-Date) - $boot).TotalHours))
 $perDay = [math]::Round(@($crit).Count / $hours * 24)
 $msg = "{0} за {1} ч (~{2}/сутки; было ~24/сутки)" -f @($crit).Count, $hours, $perDay
+if ($hours -lt 6) { $msg = "{0} за {1} ч (для оценки в сутки нужно 6+ ч работы)" -f @($crit).Count, $hours; $perDay = @($crit).Count }
 if ($perDay -le 10) { Add-Check OK 'Ошибки в журнале System' $msg } else { Add-Check WARN 'Ошибки в журнале System' $msg }
 $crit | Group-Object ProviderName, Id | Sort-Object Count -Descending | Select-Object -First 8 | ForEach-Object {
     $l = "   {0,4} x {1} — {2}" -f $_.Count, $_.Name, (($_.Group[0].Message -split "`n")[0])

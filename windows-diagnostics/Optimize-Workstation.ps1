@@ -101,7 +101,7 @@ try {
     $dr = $searcher.Search("IsInstalled=0 and IsHidden=0 and Type='Driver'")
     Say ("  Обновлений ПО Windows: {0}" -f $sw.Updates.Count)
     foreach ($u in $sw.Updates) { Say ("    - {0}" -f $u.Title) }
-    Say ("  Драйверов в Windows Update: {0} (только список — ставить вручную по необходимости)" -f $dr.Updates.Count)
+    Say ("  Драйверов в Windows Update: {0} (только список; сверяйте версию с установленной — WU часто предлагает более старые)" -f $dr.Updates.Count)
     foreach ($u in $dr.Updates) { Say ("    - {0}" -f $u.Title) }
 
     if ($sw.Updates.Count -gt 0 -and (Confirm-Step "Скачать и установить обновления Windows (без драйверов)?")) {
@@ -129,8 +129,10 @@ Head 5 'ДРАЙВЕРЫ (аудит ключевых устройств)'
 $classes = 'Display','Net','System','SCSIAdapter','HDC','MEDIA','Bluetooth','USB'
 $drivers = Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceClass -in $classes -and $_.DriverProviderName -notmatch '^Microsoft' -and $_.DeviceName }
 $drivers | Sort-Object DeviceClass, DeviceName | ForEach-Object {
-    $age = if ($_.DriverDate) { [int]((Get-Date) - $_.DriverDate).TotalDays / 365 } else { 0 }
-    $mark = if ($age -ge 3) { '  <-- старше 3 лет' } else { '' }
+    # Intel INF-драйверы чипсета намеренно датированы 1968 г. — это не «старый» драйвер, а метка низкого приоритета
+    $placeholder = $_.DriverDate -and $_.DriverDate.Year -lt 2000
+    $age = if ($_.DriverDate -and -not $placeholder) { [int]((Get-Date) - $_.DriverDate).TotalDays / 365 } else { 0 }
+    $mark = if ($placeholder) { '  (INF чипсета, дата-заглушка — норма)' } elseif ($age -ge 3) { '  <-- старше 3 лет' } else { '' }
     Say ("  {0,-12} {1,-50} {2,-18} {3:yyyy-MM-dd}{4}" -f $_.DeviceClass, $_.DeviceName, $_.DriverVersion, $_.DriverDate, $mark)
     if ($age -ge 3) { Note "Устаревший драйвер: $($_.DeviceName) ($($_.DriverVersion)). Обновите с сайта производителя." }
 }
@@ -232,7 +234,7 @@ foreach ($id in $ids) {
     $name = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\CLSID\$id" -ErrorAction SilentlyContinue).'(default)'
     if (-not $name) { $name = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\AppID\$id" -ErrorAction SilentlyContinue).'(default)' }
     $srv = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\CLSID\$id\LocalServer32" -ErrorAction SilentlyContinue).'(default)'
-    Say ("  {0}  x{1}  {2}  {3}" -f $id, @($dcom | Where-Object Message -match [regex]::Escape($id)).Count, $name, $srv)
+    Say ("  {0}  x{1}  {2}  {3}" -f $id, @($dcom | Where-Object { $_.Message -match [regex]::Escape($id) }).Count, $name, $srv)
 }
 if (-not $ids) { Say "  Ошибок DCOM 10010 за 7 дней нет." 'Green' }
 

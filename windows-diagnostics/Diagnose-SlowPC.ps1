@@ -73,19 +73,23 @@ Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
 
 Write-Host "[4/12] Загрузка CPU/диска (замер 10 сек)..." -ForegroundColor Cyan
 $out += Section 'НАГРУЗКА (замер 10 сек)'
-$ctr = Get-Counter -Counter '\Processor(_Total)\% Processor Time','\PhysicalDisk(_Total)\% Disk Time','\Memory\Pages/sec' -SampleInterval 2 -MaxSamples 5
-if ($ctr) {
-    $avg = $ctr.CounterSamples | Group-Object Path | ForEach-Object {
-        [pscustomobject]@{ Counter = $_.Name; Avg = [math]::Round(($_.Group | Measure-Object CookedValue -Average).Average, 1) }
-    }
-    $avg | ForEach-Object { $out += "{0,-55} {1}" -f $_.Counter, $_.Avg }
-    $cpuAvg  = ($avg | Where-Object Counter -like '*processor time*').Avg
-    $diskAvg = ($avg | Where-Object Counter -like '*disk time*').Avg
-    $pages   = ($avg | Where-Object Counter -like '*pages/sec*').Avg
-    if ($cpuAvg  -ge 70)  { Flag "CPU загружен в среднем на $cpuAvg % в простое — смотрите «ТОП процессов по CPU»." }
-    if ($diskAvg -ge 80)  { Flag "Диск загружен на $diskAvg % — узкое место в диске (HDD, индексация, антивирус, обновления)." }
-    if ($pages   -ge 500) { Flag "Активный свопинг ($pages стр/с) — не хватает оперативной памяти." }
-} else { $out += "(счётчики производительности недоступны — возможно, неанглийские имена счётчиков)" }
+# CIM-классы вместо Get-Counter: имена счётчиков в русской Windows локализованы
+$cpuS = @(); $diskS = @(); $pageS = @()
+for ($n = 0; $n -lt 5; $n++) {
+    $cpuS  += (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
+    $diskS += (Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'").PercentDiskTime
+    $pageS += (Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory).PagesPersec
+    Start-Sleep -Seconds 2
+}
+$cpuAvg  = [math]::Round(($cpuS  | Measure-Object -Average).Average, 1)
+$diskAvg = [math]::Round(($diskS | Measure-Object -Average).Average, 1)
+$pages   = [math]::Round(($pageS | Measure-Object -Average).Average, 1)
+$out += "CPU, среднее:              $cpuAvg %"
+$out += "Активность диска, среднее: $diskAvg % (может быть >100 при нескольких дисках)"
+$out += "Подкачка, стр/с:           $pages"
+if ($cpuAvg  -ge 70)  { Flag "CPU загружен в среднем на $cpuAvg % — смотрите «ТОП процессов по CPU»." }
+if ($diskAvg -ge 80)  { Flag "Диск загружен на $diskAvg % — узкое место в диске (HDD, индексация, антивирус, обновления)." }
+if ($pages   -ge 500) { Flag "Активный свопинг ($pages стр/с) — не хватает оперативной памяти." }
 
 Write-Host "[5/12] Процессы..." -ForegroundColor Cyan
 $out += Section 'ТОП-15 ПРОЦЕССОВ ПО ПАМЯТИ'
@@ -182,7 +186,8 @@ $bsod = $ev | Where-Object { $_.Id -eq 41 -and $_.ProviderName -eq 'Microsoft-Wi
 if ($bsod) { Flag "Неожиданные перезагрузки/зависания (Kernel-Power 41): $(@($bsod).Count) раз." }
 $boot = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Diagnostics-Performance/Operational'; Id=100 } -MaxEvents 1
 if ($boot) {
-    $bootSec = [math]::Round(([xml]$boot.ToXml()).Event.EventData.Data | Where-Object Name -eq 'BootTime' | ForEach-Object { [int]$_.'#text' / 1000 }, 0)
+    $bootMs  = (([xml]$boot.ToXml()).Event.EventData.Data | Where-Object { $_.Name -eq 'BootTime' }).'#text'
+    $bootSec = [math]::Round([int]$bootMs / 1000)
     $out += "Время последней загрузки: $bootSec сек"
     if ($bootSec -gt 60) { Flag "Загрузка Windows занимает $bootSec сек (норма для SSD 15–30 сек) — смотрите автозагрузку." }
 }

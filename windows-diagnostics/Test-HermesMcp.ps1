@@ -37,7 +37,12 @@ function Test-McpServer($fileName, $arguments, $label) {
     $psi.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
     $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $p = [Diagnostics.Process]::Start($psi)
+    # .NET Framework создаёт StandardInput в кодировке консоли и сразу пишет её метку BOM.
+    # На время запуска ставим UTF-8 без BOM, затем возвращаем прежнюю кодировку.
+    $oldIn = [Console]::InputEncoding
+    Write-Info ("Кодировка ввода консоли: CP{0}, длина BOM {1} байт" -f $oldIn.CodePage, $oldIn.GetPreamble().Length)
+    try { [Console]::InputEncoding = New-Object Text.UTF8Encoding $false } catch { Write-Info "Не удалось сменить кодировку ввода: $($_.Exception.Message)" }
+    try { $p = [Diagnostics.Process]::Start($psi) } finally { try { [Console]::InputEncoding = $oldIn } catch {} }
     $errTask = $p.StandardError.ReadToEndAsync()
     # Пишем напрямую в поток: стандартный StandardInput в .NET Framework при UTF-8 консоли
     # добавляет метку BOM, из-за которой MCP-сервер не может разобрать первое сообщение
@@ -87,6 +92,32 @@ $env:HERMES_HOME = "$wh\.hermes"
 
 Write-Head '2. ПРЯМОЙ ЗАПУСК hermes.exe mcp serve'
 $direct = Test-McpServer $hermes 'mcp serve' 'hermes.exe mcp serve'
+
+Write-Head '2b. НЕЗАВИСИМАЯ ПРОВЕРКА: ЗАПРОС ИЗ ФАЙЛА ЧЕРЕЗ cmd (без .NET и без BOM)'
+$req  = Join-Path $env:TEMP 'ssv_mcp_req.jsonl'
+$outF = Join-Path $env:TEMP 'ssv_mcp_out.txt'
+$errF = Join-Path $env:TEMP 'ssv_mcp_err.txt'
+$lines = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ssv-check","version":"1.0"}}}',
+         '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+         '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+[IO.File]::WriteAllText($req, (($lines -join "`n") + "`n"), [Text.Encoding]::ASCII)
+$env:HERMES_HOME = "$wh\.hermes"; $env:HERMES_REDACT_SECRETS = 'true'; $env:PYTHONUNBUFFERED = '1'; $env:PYTHONIOENCODING = 'utf-8'
+$sw2 = [Diagnostics.Stopwatch]::StartNew()
+$cp = Start-Process cmd.exe -ArgumentList "/c type `"$req`" | `"$hermes`" mcp serve" -RedirectStandardOutput $outF -RedirectStandardError $errF -NoNewWindow -PassThru
+if (-not $cp.WaitForExit($TimeoutSec * 1000)) { try { $cp.Kill() } catch {}; Write-Info "Процесс не завершился за $TimeoutSec сек" }
+$outTxt = if (Test-Path $outF) { Get-Content $outF -Raw -Encoding UTF8 } else { '' }
+$pipeOk = $outTxt -match '"id"\s*:\s*1[,}]' -and $outTxt -match '"serverInfo"'
+if ($pipeOk) {
+    $name  = ([regex]::Match($outTxt, '"serverInfo"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"')).Groups[1].Value
+    $tools = [regex]::Matches(($outTxt -split "`r?`n" | Where-Object { $_ -match '"id"\s*:\s*2' }) -join '', '"name"\s*:\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+    Write-Host ("  [OK] Hermes ответил за {0:N1} сек: {1}. Инструментов: {2}. Примеры: {3}" -f $sw2.Elapsed.TotalSeconds, $name, @($tools).Count, (($tools | Select-Object -First 12) -join ', ')) -ForegroundColor Green
+    $direct = $true
+} else {
+    Write-Host '  [FAIL] Нет корректного ответа на initialize.' -ForegroundColor Red
+    if ($outTxt) { Write-Info 'stdout:'; ($outTxt -split "`r?`n" | Where-Object { $_ } | Select-Object -First 10) | ForEach-Object { Write-Info ("   " + (Hide-Secrets $_)) } }
+}
+if (Test-Path $errF) { $e2 = Get-Content $errF -Encoding UTF8 | Where-Object { $_ } | Select-Object -Last 25; if ($e2) { Write-Info 'stderr (последние строки):'; $e2 | ForEach-Object { Write-Info ("   " + (Hide-Secrets $_)) } } }
+Remove-Item $req, $outF, $errF -Force -ErrorAction SilentlyContinue
 
 Write-Head '3. ЗАПУСК ЧЕРЕЗ ОБЁРТКУ hermes-mcp.ps1'
 $wrapped = Test-McpServer 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$wh\hermes-mcp.ps1`"" 'powershell -File hermes-mcp.ps1'

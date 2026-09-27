@@ -39,8 +39,11 @@ function Test-McpServer($fileName, $arguments, $label) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $p = [Diagnostics.Process]::Start($psi)
     $errTask = $p.StandardError.ReadToEndAsync()
-    $p.StandardInput.WriteLine('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ssv-check","version":"1.0"}}}')
-    $p.StandardInput.Flush()
+    # Пишем напрямую в поток: стандартный StandardInput в .NET Framework при UTF-8 консоли
+    # добавляет метку BOM, из-за которой MCP-сервер не может разобрать первое сообщение
+    $in = New-Object IO.StreamWriter($p.StandardInput.BaseStream, (New-Object Text.UTF8Encoding $false))
+    $in.NewLine = "`n"; $in.AutoFlush = $true
+    $in.WriteLine('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ssv-check","version":"1.0"}}}')
     $ok = $false; $other = @()
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline -and -not $p.HasExited) {
@@ -53,19 +56,24 @@ function Test-McpServer($fileName, $arguments, $label) {
             $ok = $true
             $name = ([regex]::Match($line, '"serverInfo"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"')).Groups[1].Value
             Write-Host ("  [OK] Ответ за {0:N1} сек: {1}" -f $sw.Elapsed.TotalSeconds, $name) -ForegroundColor Green
-            $p.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
-            $p.StandardInput.WriteLine('{"jsonrpc":"2.0","id":2,"method":"tools/list"}'); $p.StandardInput.Flush()
-            $t2 = $p.StandardOutput.ReadLineAsync()
-            if ($t2.Wait(20000) -and $t2.Result) {
-                $tools = [regex]::Matches($t2.Result, '"name"\s*:\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
-                Write-Info ("Инструментов: {0}. Примеры: {1}" -f @($tools).Count, (($tools | Select-Object -First 15) -join ', '))
+            $in.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
+            $in.WriteLine('{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+            $until = (Get-Date).AddSeconds(30)
+            while ((Get-Date) -lt $until) {
+                $t2 = $p.StandardOutput.ReadLineAsync()
+                if (-not $t2.Wait(30000) -or -not $t2.Result) { break }
+                if ($t2.Result -match '"id"\s*:\s*2') {
+                    $tools = [regex]::Matches($t2.Result, '"name"\s*:\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+                    Write-Info ("Инструментов: {0}. Примеры: {1}" -f @($tools).Count, (($tools | Select-Object -First 15) -join ', '))
+                    break
+                }
             }
             break
         } else { $other += $line }
     }
     if (-not $ok) { Write-Host ("  [FAIL] Нет ответа за {0:N0} сек (процесс {1})" -f $sw.Elapsed.TotalSeconds, $(if ($p.HasExited) { "завершился, код $($p.ExitCode)" } else { 'висел' })) -ForegroundColor Red }
     if (-not $p.HasExited) { try { $p.Kill() } catch {} }
-    if ($other.Count) { Write-Info 'Лишние строки в stdout (мешают протоколу MCP):'; $other | Select-Object -First 10 | ForEach-Object { Write-Info ("   " + (Hide-Secrets $_)) } }
+    if ($other.Count) { Write-Info 'Другие сообщения сервера:'; $other | Select-Object -First 10 | ForEach-Object { Write-Info ("   " + (Hide-Secrets $_)) } }
     $err = if ($errTask.Wait(5000)) { $errTask.Result } else { '' }
     if ($err) { Write-Info 'stderr (последние строки):'; ($err -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 20) | ForEach-Object { Write-Info ("   " + (Hide-Secrets $_)) } }
     return $ok

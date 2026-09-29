@@ -81,17 +81,28 @@ function Invoke-Safe([scriptblock]$Block, $Default = $null) {
 $script:CloudMask = 0x441000
 $script:ReparseFlag = [int][IO.FileAttributes]::ReparsePoint
 
+$script:CloudRoots = @(@($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial) + @(if ($env:USERPROFILE) { Join-Path $env:USERPROFILE 'iCloudDrive' }) |
+    Where-Object { $_ } | Select-Object -Unique)
+
 function Test-SkipDir([IO.DirectoryInfo]$Dir) {
-    # Пропускаем junction/symlink (иначе двойной учёт и циклы), но не облачные папки OneDrive
+    # Пропускаем junction/symlink ("All Users", "Все пользователи" и т.п. — иначе двойной учёт),
+    # но заходим в облачные папки OneDrive/iCloud: там каталоги тоже бывают точками повторной обработки
     if (([int]$Dir.Attributes -band $script:ReparseFlag) -eq 0) { return $false }
-    $lt = Invoke-Safe { $Dir.LinkType }
-    return ($lt -eq 'Junction' -or $lt -eq 'SymbolicLink')
+    foreach ($r in $script:CloudRoots) {
+        if ($Dir.FullName.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
 }
 
 # Размер папки (или файла) без учёта ссылок и облачных заглушек
 function Measure-Tree([string]$Path) {
     $r = [ordered]@{ Path = $Path; Exists = $false; Bytes = [long]0; Files = 0; Errors = 0; Size = '' }
-    if (-not (Test-Path -LiteralPath $Path)) { $r.Size = '-'; return [pscustomobject]$r }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        # Test-Path не видит занятые системные файлы (pagefile.sys) — ищем через родительскую папку
+        $fi = Invoke-Safe { (New-Object IO.DirectoryInfo (Split-Path $Path -Parent)).GetFiles((Split-Path $Path -Leaf)) | Select-Object -First 1 }
+        if ($fi) { $r.Exists = $true; $r.Bytes = [long]$fi.Length; $r.Files = 1; $r.Size = Format-Size $r.Bytes; return [pscustomobject]$r }
+        $r.Size = '-'; return [pscustomobject]$r
+    }
     $r.Exists = $true
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if ($item -and -not $item.PSIsContainer) {
@@ -381,6 +392,9 @@ function Invoke-DiskAudit {
         if ($obj.IsBoot -and $obj.MediaType -eq 'HDD') {
             Add-Finding WARNING $name 'Windows установлена на HDD' 'Перенос системы на SSD (NVMe/SATA) ускорит работу в 5-10 раз.'
         }
+        if ($obj.Model -match 'WD\d0EFAX') {
+            Add-Finding INFO $name 'Диск с черепичной записью (SMR, WD Red EFAX): медленная длительная запись' 'Подходит для архива; не использовать для активной работы, монтажа видео и RAID.'
+        }
         if ($obj.PartitionStyle -eq 'MBR' -and $obj.SizeBytes -gt 2.2TB) {
             Add-Finding WARNING $name 'Разметка MBR на диске > 2 ТБ — часть объёма недоступна' 'Конвертация в GPT (mbr2gpt для системного диска, бэкап обязателен).'
         }
@@ -440,6 +454,13 @@ function Invoke-DiskAudit {
         }
     }
     $report.Volumes = $volumes
+    $sysVol = $volumes | Where-Object Letter -eq $sysDrive | Select-Object -First 1
+    if ($isAdmin -and $sysVol -and $sysVol.BitLocker -like 'On*') {
+        $plain = @($volumes | Where-Object { $_.DriveType -eq 'Fixed' -and $_.Letter -ne $sysDrive -and $_.BitLocker -like 'Off*' } | ForEach-Object { "$($_.Letter):" })
+        if ($plain.Count) {
+            Add-Finding WARNING 'Шифрование' "Системный диск зашифрован, а диски $($plain -join ', ') — нет" 'Данные и резервные копии с незашифрованных дисков читаются без пароля. Включить BitLocker: Проводник → ПКМ по диску → «Включить BitLocker»; ключ восстановления сохранить отдельно.'
+        }
+    }
 
     # --- TRIM и оптимизация
     Write-Step 'TRIM и плановая оптимизация'
@@ -575,9 +596,18 @@ function Invoke-DiskAudit {
 
     # Теневые копии / точки восстановления
     $shadow = @(Invoke-Safe { Get-CimInstance Win32_ShadowStorage -ErrorAction Stop } @())
+    $winVolumes = @(Invoke-Safe { Get-CimInstance Win32_Volume -ErrorAction Stop } @())
     $report.ShadowStorage = @($shadow | ForEach-Object {
-        [pscustomobject]@{ Volume = [string]$_.Volume.DeviceID; Used = Format-Size $_.UsedSpace; Allocated = Format-Size $_.AllocatedSpace; Max = Format-Size $_.MaxSpace; UsedBytes = [long]$_.UsedSpace }
+        $dev = [string]$_.Volume.DeviceID
+        $wv = $winVolumes | Where-Object DeviceID -eq $dev | Select-Object -First 1
+        [pscustomobject]@{ Volume = if ($wv -and $wv.DriveLetter) { $wv.DriveLetter } else { $dev }; Used = Format-Size $_.UsedSpace; Allocated = Format-Size $_.AllocatedSpace; Max = Format-Size $_.MaxSpace; UsedBytes = [long]$_.UsedSpace }
     })
+    if ($isAdmin) {
+        $sysShadow = $report.ShadowStorage | Where-Object Volume -eq $env:SystemDrive | Select-Object -First 1
+        if (-not $sysShadow -or $sysShadow.UsedBytes -eq 0) {
+            Add-Finding WARNING 'Точки восстановления' "На системном диске $($env:SystemDrive) нет ни одной точки восстановления" 'Включить: Панель управления → Система → Защита системы → C: → Настроить → 5%. Создать точку: Checkpoint-Computer -Description "Manual" -RestorePointType MODIFY_SETTINGS'
+        }
+    }
 
     function GB($name) { [double]$knownMap[$name] / 1GB }
     if ((GB 'Временные файлы пользователя (TEMP)') + (GB 'Временные файлы Windows') -gt 1) {
@@ -607,7 +637,7 @@ function Invoke-DiskAudit {
         Add-Finding INFO 'Индекс поиска' ("Индекс поиска: {0:N1} GB" -f (GB 'Индекс поиска Windows')) 'Параметры → Поиск в Windows → Дополнительные параметры индексатора → Перестроить / сократить папки.'
     }
     foreach ($s in $report.ShadowStorage | Where-Object { $_.UsedBytes -gt 20GB }) {
-        Add-Finding INFO 'Точки восстановления' "Теневые копии на $($s.Volume): $($s.Used)" 'Защита системы → Настроить → ограничить до 5-10% (не отключать полностью).'
+        Add-Finding INFO 'Теневые копии' "Теневые копии на $($s.Volume): $($s.Used) (лимит $($s.Max))" 'Это точки восстановления или старые версии образа системы (Windows Backup). Список: vssadmin list shadows /for=<диск>. Лимит: vssadmin resize shadowstorage /for=<диск> /on=<диск> /maxsize=<размер>.'
     }
 
     # --- Docker / WSL
@@ -626,8 +656,11 @@ function Invoke-DiskAudit {
     }
     $wslList = ''
     if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
-        $env:WSL_UTF8 = '1'
-        $wslList = Invoke-Safe { ((wsl.exe --list --verbose 2>&1) -join "`n") -replace "`0", '' } ''
+        $prevEnc = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [Text.Encoding]::Unicode   # wsl.exe пишет в UTF-16
+            $wslList = Invoke-Safe { ((wsl.exe --list --verbose 2>&1) -join "`n") -replace "`0", '' } ''
+        } finally { [Console]::OutputEncoding = $prevEnc }
     }
     $report.DockerWsl = [ordered]@{ VirtualDisks = $vhdx; DockerSystemDf = $dockerDf; WslList = $wslList }
     foreach ($v in $vhdx | Where-Object { $_.Bytes -gt 20GB }) {
@@ -691,6 +724,15 @@ function Invoke-DiskAudit {
                 Add-Finding ORDER "Диск ${l}:" "Крупный образ/архив $($bf.Size): $($bf.Path)" 'Проверить актуальность: удалить или перенести в архив.'
             }
         }
+        $backupSets = @($report.DriveScans | ForEach-Object { $_.TopLevel2 } | Where-Object { $_.Path -match '\\Backup Set \d{4}-\d{2}-\d{2}' })
+        $imageBk = @($report.DriveScans | ForEach-Object { $_.TopLevel } | Where-Object { $_.Path -match '\\WindowsImageBackup$' })
+        if ($backupSets.Count -gt 3) {
+            $bsBytes = [long](($backupSets | Measure-Object Bytes -Sum).Sum)
+            Add-Finding WARNING 'Резервные копии' "$($backupSets.Count) наборов архивации Windows занимают $(Format-Size $bsBytes)" 'Оставить 2-3 последних: Панель управления → Архивация и восстановление (Windows 7) → Управление пространством → Просмотр архивов → удалить старые периоды.'
+        }
+        if ($backupSets.Count -or $imageBk.Count) {
+            Add-Finding WARNING 'Резервные копии' 'Резервные копии хранятся на внутреннем диске этого же компьютера' 'При краже, пожаре, скачке напряжения или шифровальщике копии пропадут вместе с оригиналом. Нужна копия на внешнем диске (хранить отдельно) и/или в облаке (правило 3-2-1).'
+        }
         if ($allDup.Count -gt 1) {
             Write-Step 'Поиск дубликатов крупных файлов'
             $dups = Find-Duplicates $allDup
@@ -699,7 +741,7 @@ function Invoke-DiskAudit {
             $report.DuplicatesWastedBytes = $wasted
             $report.DuplicatesWasted = Format-Size $wasted
             if ($wasted -gt 1GB) {
-                Add-Finding ORDER 'Дубликаты' "Вероятные дубликаты файлов > $DupMinMB MB занимают лишние $(Format-Size $wasted)" 'Проверить список в отчёте (раздел «Дубликаты»); удалять вручную, оставив одну копию в правильной папке.'
+                Add-Finding ORDER 'Дубликаты' "Вероятные дубликаты файлов > $DupMinMB MB (включая намеренные резервные копии) занимают $(Format-Size $wasted)" 'Проверить список в отчёте (раздел «Дубликаты»); удалять вручную, оставив одну копию в правильной папке.'
             }
         }
     }
